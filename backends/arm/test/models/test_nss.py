@@ -36,7 +36,9 @@ def nss() -> AutoEncoderV1:
     """Get an instance of NSS with weights loaded."""
 
     weights = hf_hub_download(
-        repo_id="Arm/neural-super-sampling", filename="nss_v0.1.0_fp32.pt"
+        repo_id="Arm/neural-super-sampling",
+        filename="nss_v0.1.0_fp32.pt",
+        revision="2e9b606acd9fa25071825a12f0764f1c3bef9480",
     )
 
     nss_model = NSS()
@@ -108,30 +110,30 @@ def test_nss_u85_INT():
     reason="[MLETORCH-1430]: Double types are not supported in buffers in MSL"
 )
 @common.SkipIfNoModelConverter
-def test_nss_vgf_FP():
+def test_nss_vgf_no_quant():
     pipeline = VgfPipeline[input_t](
         nss().eval(),
         example_inputs(),
         aten_op=[],
         exir_op=[],
-        tosa_version="TOSA-1.0+FP",
         use_to_edge_transform_and_lower=True,
         run_on_vulkan_runtime=True,
+        quantize=False,
     )
     pipeline.run()
 
 
 @common.SkipIfNoModelConverter
-def test_nss_vgf_INT():
+def test_nss_vgf_quant():
     pipeline = VgfPipeline[input_t](
         nss().eval(),
         example_inputs(),
         aten_op=[],
         exir_op=[],
-        tosa_version="TOSA-1.0+INT",
         symmetric_io_quantization=True,
         use_to_edge_transform_and_lower=True,
         run_on_vulkan_runtime=True,
+        quantize=True,
     )
     pipeline.run()
 
