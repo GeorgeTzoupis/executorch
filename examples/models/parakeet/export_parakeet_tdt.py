@@ -7,7 +7,6 @@ import tarfile
 import tempfile
 
 import torch
-
 import torchaudio
 from executorch.exir import (
     EdgeCompileConfig,
@@ -299,8 +298,15 @@ def export_all(model):
     )
     torch.cuda.is_available = old_cuda_is_available
 
+    # Detect encoder dtype from first linear layer
+    encoder_dtype = torch.float32
+    for module in model.encoder.modules():
+        if isinstance(module, torch.nn.Linear):
+            encoder_dtype = module.weight.dtype
+            break
+
     feat_in = getattr(model.encoder, "_feat_in", 128)
-    audio_signal = torch.randn(1, feat_in, 100)
+    audio_signal = torch.randn(1, feat_in, 100, dtype=encoder_dtype)
     length = torch.tensor([100], dtype=torch.int64)
     programs["encoder"] = export(
         model.encoder,
@@ -310,13 +316,20 @@ def export_all(model):
         strict=False,
     )
 
+    # Detect decoder dtype
+    decoder_dtype = torch.float32
+    for module in model.decoder.modules():
+        if isinstance(module, torch.nn.Linear):
+            decoder_dtype = module.weight.dtype
+            break
+
     decoder_predict = DecoderPredict(model.decoder)
     decoder_predict.eval()
     token = torch.tensor([[0]], dtype=torch.long)
     num_layers = model.decoder.pred_rnn_layers
     pred_hidden = model.decoder.pred_hidden
-    h = torch.zeros(num_layers, 1, pred_hidden)
-    c = torch.zeros(num_layers, 1, pred_hidden)
+    h = torch.zeros(num_layers, 1, pred_hidden, dtype=decoder_dtype)
+    c = torch.zeros(num_layers, 1, pred_hidden, dtype=decoder_dtype)
     programs["decoder_predict"] = export(
         decoder_predict,
         (token, h, c),
@@ -324,10 +337,16 @@ def export_all(model):
         strict=False,
     )
 
+    # Detect joint dtype
+    joint_dtype = torch.float32
+    for module in model.joint.modules():
+        if isinstance(module, torch.nn.Linear):
+            joint_dtype = module.weight.dtype
+            break
     joint_hidden = model.joint.joint_hidden
 
-    f_proj = torch.randn(1, 1, joint_hidden)
-    g_proj = torch.randn(1, 1, joint_hidden)
+    f_proj = torch.randn(1, 1, joint_hidden, dtype=joint_dtype)
+    g_proj = torch.randn(1, 1, joint_hidden, dtype=joint_dtype)
     programs["joint"] = export(
         JointAfterProjection(model.joint),
         (f_proj, g_proj),
@@ -337,16 +356,18 @@ def export_all(model):
 
     enc_output_dim = getattr(model.encoder, "_feat_out", 1024)
 
+    enc_proj_input = torch.randn(1, 25, enc_output_dim, dtype=encoder_dtype)
     programs["joint_project_encoder"] = export(
         JointProjectEncoder(model.joint),
-        (torch.randn(1, 25, enc_output_dim),),
+        (enc_proj_input,),
         dynamic_shapes={"f": {1: Dim("enc_time", min=1, max=60000)}},
         strict=False,
     )
 
+    dec_proj_input = torch.randn(1, 1, pred_hidden, dtype=decoder_dtype)
     programs["joint_project_decoder"] = export(
         JointProjectDecoder(model.joint),
-        (torch.randn(1, 1, pred_hidden),),
+        (dec_proj_input,),
         dynamic_shapes={"g": {}},
         strict=False,
     )
@@ -464,11 +485,27 @@ def _create_cuda_partitioners(programs, is_windows=False):
     return partitioner, updated_programs
 
 
+def _create_mlx_partitioners(programs):
+    """Create MLX partitioners for all programs."""
+    from executorch.backends.apple.mlx.partitioner import MLXPartitioner
+
+    print("\nLowering to ExecuTorch with MLX...")
+
+    # MLX backend doesn't need decompositions
+    partitioner = {}
+    for key in programs.keys():
+        partitioner[key] = [MLXPartitioner()]
+
+    return partitioner, programs
+
+
 def lower_to_executorch(programs, metadata=None, backend="portable"):
     if backend == "xnnpack":
         partitioner, programs = _create_xnnpack_partitioners(programs)
     elif backend == "metal":
         partitioner, programs = _create_metal_partitioners(programs)
+    elif backend == "mlx":
+        partitioner, programs = _create_mlx_partitioners(programs)
     elif backend in ("cuda", "cuda-windows"):
         partitioner, programs = _create_cuda_partitioners(
             programs, is_windows=(backend == "cuda-windows")
@@ -510,7 +547,7 @@ def main():
         "--backend",
         type=str,
         default="portable",
-        choices=["portable", "xnnpack", "metal", "cuda", "cuda-windows"],
+        choices=["portable", "xnnpack", "metal", "mlx", "cuda", "cuda-windows"],
         help="Backend for acceleration (default: portable)",
     )
     parser.add_argument(
