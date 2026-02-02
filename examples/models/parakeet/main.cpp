@@ -31,6 +31,7 @@
 #include <executorch/extension/module/module.h>
 #include <executorch/extension/tensor/tensor_ptr_maker.h>
 #include <executorch/runtime/core/evalue.h>
+#include <executorch/runtime/core/portable_type/bfloat16.h>
 #include <executorch/runtime/platform/log.h>
 
 DEFINE_string(model_path, "parakeet.pte", "Path to Parakeet model (.pte).");
@@ -123,30 +124,58 @@ std::vector<Token> greedy_decode_executorch(
   int64_t enc_dim = enc_sizes[1];
   int64_t time_steps = enc_sizes[2];
 
-  // Create transposed tensor
-  std::vector<float> transposed_data(batch * time_steps * enc_dim);
-  const float* src = encoder_output.const_data_ptr<float>();
-  for (int64_t t = 0; t < time_steps; t++) {
-    for (int64_t d = 0; d < enc_dim; d++) {
-      transposed_data[t * enc_dim + d] = src[d * time_steps + t];
+  // Determine dtype - keep same as encoder output for model compatibility
+  bool is_bf16 =
+      encoder_output.scalar_type() == ::executorch::aten::ScalarType::BFloat16;
+
+  if (is_bf16) {
+    std::cout << "Encoder output is bf16, transposing as bf16" << std::endl;
+  }
+
+  // Create transposed tensor in the same dtype as encoder output
+  // For bf16, we work with raw uint16_t; for float32, we use float
+  std::vector<uint16_t> transposed_bf16;
+  std::vector<float> transposed_f32;
+
+  if (is_bf16) {
+    transposed_bf16.resize(batch * time_steps * enc_dim);
+    const uint16_t* src =
+        reinterpret_cast<const uint16_t*>(encoder_output.const_data_ptr());
+    for (int64_t t = 0; t < time_steps; t++) {
+      for (int64_t d = 0; d < enc_dim; d++) {
+        transposed_bf16[t * enc_dim + d] = src[d * time_steps + t];
+      }
+    }
+  } else {
+    transposed_f32.resize(batch * time_steps * enc_dim);
+    const float* src = encoder_output.const_data_ptr<float>();
+    for (int64_t t = 0; t < time_steps; t++) {
+      for (int64_t d = 0; d < enc_dim; d++) {
+        transposed_f32[t * enc_dim + d] = src[d * time_steps + t];
+      }
     }
   }
 
   auto transposed_tensor = from_blob(
-      transposed_data.data(),
+      is_bf16 ? reinterpret_cast<void*>(transposed_bf16.data())
+              : reinterpret_cast<void*>(transposed_f32.data()),
       {static_cast<::executorch::aten::SizesType>(batch),
        static_cast<::executorch::aten::SizesType>(time_steps),
        static_cast<::executorch::aten::SizesType>(enc_dim)},
-      ::executorch::aten::ScalarType::Float);
+      is_bf16 ? ::executorch::aten::ScalarType::BFloat16
+              : ::executorch::aten::ScalarType::Float);
 
   // Project encoder output
+  std::cout << "Calling joint_project_encoder..." << std::endl;
   auto proj_enc_result = model.execute(
       "joint_project_encoder",
       std::vector<::executorch::runtime::EValue>{transposed_tensor});
   if (!proj_enc_result.ok()) {
+    std::cout << "joint_project_encoder FAILED" << std::endl;
     ET_LOG(Error, "joint_project_encoder failed");
     return hypothesis;
   }
+  std::cout << "joint_project_encoder succeeded" << std::endl;
   auto f_proj = proj_enc_result.get()[0].toTensor();
 
   // Initialize LSTM state
@@ -175,13 +204,16 @@ std::vector<Token> greedy_decode_executorch(
   std::vector<int64_t> sos_token_data = {blank_id};
   auto sos_token = from_blob(
       sos_token_data.data(), {1, 1}, ::executorch::aten::ScalarType::Long);
+  std::cout << "Calling decoder_predict (SOS)..." << std::endl;
   auto decoder_init_result = model.execute(
       "decoder_predict",
       std::vector<::executorch::runtime::EValue>{sos_token, h, c});
   if (!decoder_init_result.ok()) {
+    std::cout << "decoder_predict (SOS) FAILED" << std::endl;
     ET_LOG(Error, "decoder_predict (SOS) failed");
     return hypothesis;
   }
+  std::cout << "decoder_predict (SOS) succeeded" << std::endl;
   auto& init_outputs = decoder_init_result.get();
   auto g_init = init_outputs[0].toTensor();
   auto new_h_init = init_outputs[1].toTensor();
@@ -212,37 +244,117 @@ std::vector<Token> greedy_decode_executorch(
   int64_t t = 0;
   int64_t symbols_on_frame = 0;
 
+  std::cout << "Starting decode loop, encoder_len=" << encoder_len
+            << ", blank_id=" << blank_id
+            << ", num_token_classes=" << num_token_classes << std::endl;
+
   // Scan over encoder output
   while (t < encoder_len) {
+    if (t < 3) {
+      std::cout << "Loop iteration t=" << t << std::endl;
+    }
+
+    // Check f_proj dtype
+    bool f_proj_is_bf16 =
+        f_proj.scalar_type() == ::executorch::aten::ScalarType::BFloat16;
+    if (t == 0) {
+      std::cout << "f_proj dtype: " << (f_proj_is_bf16 ? "bf16" : "f32")
+                << std::endl;
+    }
+
     // Get encoder frame at time t: f_proj[:, t:t+1, :]
-    const float* f_proj_data = f_proj.const_data_ptr<float>();
     int64_t proj_dim = f_proj.sizes()[2];
 
-    std::vector<float> f_t_data(1 * 1 * proj_dim);
-    for (int64_t d = 0; d < proj_dim; d++) {
-      f_t_data[d] = f_proj_data[t * proj_dim + d];
+    // Keep f_t in same dtype as f_proj for joint network compatibility
+    std::vector<uint16_t> f_t_bf16;
+    std::vector<float> f_t_f32;
+
+    if (f_proj_is_bf16) {
+      f_t_bf16.resize(1 * 1 * proj_dim);
+      const uint16_t* f_proj_data =
+          reinterpret_cast<const uint16_t*>(f_proj.const_data_ptr());
+      for (int64_t d = 0; d < proj_dim; d++) {
+        f_t_bf16[d] = f_proj_data[t * proj_dim + d];
+      }
+    } else {
+      f_t_f32.resize(1 * 1 * proj_dim);
+      const float* f_proj_data = f_proj.const_data_ptr<float>();
+      for (int64_t d = 0; d < proj_dim; d++) {
+        f_t_f32[d] = f_proj_data[t * proj_dim + d];
+      }
     }
+
     auto f_t = from_blob(
-        f_t_data.data(),
+        f_proj_is_bf16 ? reinterpret_cast<void*>(f_t_bf16.data())
+                       : reinterpret_cast<void*>(f_t_f32.data()),
         {1, 1, static_cast<::executorch::aten::SizesType>(proj_dim)},
-        ::executorch::aten::ScalarType::Float);
+        f_proj_is_bf16 ? ::executorch::aten::ScalarType::BFloat16
+                       : ::executorch::aten::ScalarType::Float);
+
+    // g_proj needs to match f_t dtype for joint network
+    // g_proj_data is f32, convert to bf16 if needed
+    std::vector<uint16_t> g_proj_bf16;
+    if (f_proj_is_bf16) {
+      g_proj_bf16.resize(proj_dim);
+      for (int64_t d = 0; d < proj_dim; d++) {
+        // Convert f32 to bf16: truncate lower 16 bits
+        uint32_t f32_bits;
+        std::memcpy(&f32_bits, &g_proj_data[d], sizeof(float));
+        g_proj_bf16[d] = static_cast<uint16_t>(f32_bits >> 16);
+      }
+    }
 
     auto g_proj = from_blob(
-        g_proj_data.data(),
+        f_proj_is_bf16 ? reinterpret_cast<void*>(g_proj_bf16.data())
+                       : reinterpret_cast<void*>(g_proj_data.data()),
         {1, 1, static_cast<::executorch::aten::SizesType>(proj_dim)},
-        ::executorch::aten::ScalarType::Float);
+        f_proj_is_bf16 ? ::executorch::aten::ScalarType::BFloat16
+                       : ::executorch::aten::ScalarType::Float);
 
     // Joint network
+    if (t < 3) {
+      std::cout << "Calling joint network at t=" << t << std::endl;
+    }
     auto joint_result = model.execute(
         "joint", std::vector<::executorch::runtime::EValue>{f_t, g_proj});
     if (!joint_result.ok()) {
+      std::cout << "joint FAILED at t=" << t << std::endl;
       ET_LOG(Error, "joint failed at t=%lld", static_cast<long long>(t));
       return hypothesis;
     }
+    if (t < 3) {
+      std::cout << "joint succeeded at t=" << t << std::endl;
+    }
     auto full_logits = joint_result.get()[0].toTensor();
 
-    // Split logits into token and duration
-    const float* logits_data = full_logits.const_data_ptr<float>();
+    // Convert logits to f32 if needed (joint may output bf16)
+    std::vector<float> logits_f32;
+    const float* logits_data;
+    bool logits_is_bf16 =
+        full_logits.scalar_type() == ::executorch::aten::ScalarType::BFloat16;
+
+    if (logits_is_bf16) {
+      logits_f32.resize(full_logits.numel());
+      const auto* bf16_data =
+          full_logits.const_data_ptr<::executorch::aten::BFloat16>();
+      for (int64_t i = 0; i < full_logits.numel(); i++) {
+        logits_f32[i] = static_cast<float>(bf16_data[i]);
+      }
+      logits_data = logits_f32.data();
+    } else {
+      logits_data = full_logits.const_data_ptr<float>();
+    }
+
+    // Debug: print first few timesteps
+    if (t < 3) {
+      std::cout << "t=" << t << " logits[0..5]: ";
+      for (int i = 0; i < 6 && i < full_logits.numel(); i++) {
+        std::cout << logits_data[i] << " ";
+      }
+      std::cout << "... logits[" << num_token_classes - 1
+                << "]=" << logits_data[num_token_classes - 1] << " (blank)"
+                << std::endl;
+    }
 
     // Find argmax for token logits
     int64_t k = 0;
@@ -252,6 +364,12 @@ std::vector<Token> greedy_decode_executorch(
         max_token_logit = logits_data[i];
         k = i;
       }
+    }
+
+    // Debug: print argmax result for first few timesteps
+    if (t < 3) {
+      std::cout << "t=" << t << " argmax k=" << k << " (blank_id=" << blank_id
+                << "), max_logit=" << max_token_logit << std::endl;
     }
 
     // Find argmax for duration logits
@@ -378,15 +496,17 @@ int main(int argc, char** argv) {
   auto audio_len_tensor = from_blob(
       audio_len_data.data(), {1}, ::executorch::aten::ScalarType::Long);
 
-  ET_LOG(Info, "Running preprocessor...");
+  std::cout << "Running preprocessor..." << std::endl;
   auto proc_result = model->execute(
       "preprocessor",
       std::vector<::executorch::runtime::EValue>{
           audio_tensor, audio_len_tensor});
+  std::cout << "Preprocessor execute() returned" << std::endl;
   if (!proc_result.ok()) {
     ET_LOG(Error, "Preprocessor forward failed.");
     return 1;
   }
+  std::cout << "Preprocessor completed successfully" << std::endl;
   auto& proc_outputs = proc_result.get();
   auto mel = proc_outputs[0].toTensor();
   auto mel_len_tensor_out = proc_outputs[1].toTensor();
@@ -406,13 +526,15 @@ int main(int argc, char** argv) {
       static_cast<long long>(mel_len_value));
 
   // Run encoder
-  ET_LOG(Info, "Running encoder...");
+  std::cout << "Running encoder..." << std::endl;
   auto enc_result = model->execute(
       "encoder", std::vector<::executorch::runtime::EValue>{mel, mel_len});
+  std::cout << "Encoder execute() returned" << std::endl;
   if (!enc_result.ok()) {
     ET_LOG(Error, "Encoder forward failed.");
     return 1;
   }
+  std::cout << "Encoder completed successfully" << std::endl;
   auto& enc_outputs = enc_result.get();
   auto encoded = enc_outputs[0].toTensor();
   int64_t encoded_len = enc_outputs[1].toTensor().const_data_ptr<int64_t>()[0];
@@ -466,7 +588,8 @@ int main(int argc, char** argv) {
       window_stride,
       encoder_subsampling_factor);
 
-  ET_LOG(Info, "Running TDT greedy decode...");
+  std::cout << "Running TDT greedy decode..." << std::endl;
+  std::cout << "encoded_len=" << encoded_len << std::endl;
   auto decoded_tokens = greedy_decode_executorch(
       *model,
       encoded,
@@ -475,8 +598,9 @@ int main(int argc, char** argv) {
       vocab_size,
       num_rnn_layers,
       pred_hidden);
+  std::cout << "TDT greedy decode completed" << std::endl;
 
-  ET_LOG(Info, "Decoded %zu tokens", decoded_tokens.size());
+  std::cout << "Decoded " << decoded_tokens.size() << " tokens" << std::endl;
 
   // Load tokenizer
   ET_LOG(Info, "Loading tokenizer from: %s", FLAGS_tokenizer_path.c_str());

@@ -25,8 +25,9 @@ python export_parakeet_tdt.py --audio /path/to/audio.wav
 | Argument | Description |
 |----------|-------------|
 | `--output-dir` | Output directory for exports (default: `./parakeet_tdt_exports`) |
-| `--backend` | Backend for acceleration: `portable`, `xnnpack`, `metal`, `cuda`, `cuda-windows` (default: `portable`) |
+| `--backend` | Backend for acceleration: `portable`, `xnnpack`, `metal`, `mlx`, `cuda`, `cuda-windows` (default: `portable`) |
 | `--dtype` | Data type: `fp32`, `bf16`, `fp16` (default: `fp32`). Metal backend supports `fp32` and `bf16` only (no `fp16`). |
+| `--quantize` | Quantization mode: `int4` for int4 weight-only quantization via TorchAO (default: none) |
 | `--audio` | Path to audio file for transcription test |
 
 **Note:** The preprocessor is always lowered with the portable backend regardless of the `--backend` setting.
@@ -42,6 +43,22 @@ This generates:
 - `aoti_metal_blob.ptd` - Metal kernel blob required at runtime
 - `tokenizer.model` - SentencePiece tokenizer
 
+### MLX Export (macOS)
+
+Export with MLX backend:
+```bash
+python export_parakeet_tdt.py --backend mlx --output-dir ./parakeet_mlx
+```
+
+Export with int4 quantization (reduces model size ~4x):
+```bash
+python export_parakeet_tdt.py --backend mlx --quantize int4 --output-dir ./parakeet_mlx_int4
+```
+
+This generates:
+- `parakeet_tdt.pte` - The compiled model with MLX delegate
+- `tokenizer.model` - SentencePiece tokenizer
+
 ## C++ Runner
 
 ### Building
@@ -54,6 +71,9 @@ cmake --workflow --preset llm-release
 
 # For Metal (macOS)
 cmake --workflow --preset llm-release-metal
+
+# For MLX (macOS)
+cmake --workflow --preset mlx-release
 ```
 
 Then build the parakeet runner:
@@ -66,12 +86,16 @@ cmake --workflow --preset parakeet-cpu
 
 # Metal build
 cmake --workflow --preset parakeet-metal
+
+# MLX build
+cmake --workflow --preset parakeet-mlx
 ```
 
 Available presets:
 - `parakeet-cpu` - CPU-only build
 - `parakeet-cuda` - CUDA acceleration (Linux/Windows)
 - `parakeet-metal` - Metal acceleration (macOS)
+- `parakeet-mlx` - MLX acceleration (macOS)
 
 ### Running
 
