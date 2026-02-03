@@ -86,14 +86,16 @@ target_compile_definitions(
 # Add CUDA include directories and link CUDA runtime when building with CUDA
 if(EXECUTORCH_BUILD_CUDA)
   find_package(CUDAToolkit REQUIRED)
+  target_compile_definitions(aoti_common_shims_slim PRIVATE CUDA_AVAILABLE=1)
   target_include_directories(
     aoti_common_shims_slim PUBLIC ${CUDAToolkit_INCLUDE_DIRS}
   )
   target_link_libraries(aoti_common_shims_slim PUBLIC CUDA::cudart)
 endif()
 
+# SlimTensor is header-only, no library to link against
 target_link_libraries(
-  aoti_common_shims_slim PUBLIC slimtensor extension_tensor ${CMAKE_DL_LIBS}
+  aoti_common_shims_slim PUBLIC extension_tensor ${CMAKE_DL_LIBS}
 )
 
 install(

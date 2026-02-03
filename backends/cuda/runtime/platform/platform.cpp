@@ -58,7 +58,12 @@ executorch::runtime::Result<void*> load_library(
   }
 
   std::string path_str = path.string();
-  void* lib_handle = dlopen(path_str.c_str(), RTLD_LAZY | RTLD_LOCAL);
+  // Use RTLD_DEEPBIND so the loaded library prefers symbols from its direct
+  // dependencies (libaoti_cuda_shims.so) over global symbols from
+  // _portable_lib.so. This ensures the SlimTensor-based aoti_torch_*
+  // implementations are used.
+  void* lib_handle =
+      dlopen(path_str.c_str(), RTLD_LAZY | RTLD_LOCAL | RTLD_DEEPBIND);
   if (lib_handle == nullptr) {
     ET_LOG(
         Error, "Failed to load %s with error: %s", path_str.c_str(), dlerror());

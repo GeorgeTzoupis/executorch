@@ -816,7 +816,11 @@ if(EXECUTORCH_BUILD_PYBIND)
   )
 
   # Build common AOTI functionality if needed by CUDA or Metal backends
-  if(EXECUTORCH_BUILD_CUDA OR EXECUTORCH_BUILD_METAL)
+  if(EXECUTORCH_BUILD_CUDA)
+    # CUDA uses SlimTensor-based shims
+    list(APPEND _dep_libs aoti_common_shims_slim)
+  elseif(EXECUTORCH_BUILD_METAL)
+    # Metal still uses ETensor-based shims (for now)
     list(APPEND _dep_libs aoti_common)
   endif()
 

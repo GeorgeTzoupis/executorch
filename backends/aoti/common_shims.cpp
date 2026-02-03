@@ -224,18 +224,22 @@ aoti_torch_get_storage_size(Tensor* tensor, int64_t* ret_size) {
 
 AOTI_SHIM_EXPORT AOTITorchError
 aoti_torch_clone_preserve_strides(Tensor* self, Tensor** ret_new_tensor) {
+  // Note: For CUDA backend, this should be handled by common_shims_slim.cpp.
+  // This fallback implementation is for non-CUDA paths using ExecuTorch Tensor.
   (void)self;
   (void)ret_new_tensor;
   throw std::runtime_error(
-      "Not implemented: aoti_torch_clone_preserve_strides");
+      "Not implemented: aoti_torch_clone_preserve_strides (ETensor version)");
   return Error::Internal;
 }
 
 AOTI_SHIM_EXPORT AOTITorchError
 aoti_torch_clone(Tensor* self, Tensor** ret_new_tensor) {
+  // Note: For CUDA backend, this should be handled by common_shims_slim.cpp.
   (void)self;
   (void)ret_new_tensor;
-  throw std::runtime_error("Not implemented: aoti_torch_clone");
+  throw std::runtime_error(
+      "Not implemented: aoti_torch_clone (ETensor version)");
   return Error::Internal;
 }
 
