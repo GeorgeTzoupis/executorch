@@ -128,10 +128,6 @@ std::vector<Token> greedy_decode_executorch(
   bool is_bf16 =
       encoder_output.scalar_type() == ::executorch::aten::ScalarType::BFloat16;
 
-  if (is_bf16) {
-    std::cout << "Encoder output is bf16, transposing as bf16" << std::endl;
-  }
-
   // Create transposed tensor in the same dtype as encoder output
   // For bf16, we work with raw uint16_t; for float32, we use float
   std::vector<uint16_t> transposed_bf16;
@@ -166,16 +162,13 @@ std::vector<Token> greedy_decode_executorch(
               : ::executorch::aten::ScalarType::Float);
 
   // Project encoder output
-  std::cout << "Calling joint_project_encoder..." << std::endl;
   auto proj_enc_result = model.execute(
       "joint_project_encoder",
       std::vector<::executorch::runtime::EValue>{transposed_tensor});
   if (!proj_enc_result.ok()) {
-    std::cout << "joint_project_encoder FAILED" << std::endl;
     ET_LOG(Error, "joint_project_encoder failed");
     return hypothesis;
   }
-  std::cout << "joint_project_encoder succeeded" << std::endl;
   auto f_proj = proj_enc_result.get()[0].toTensor();
 
   // Initialize LSTM state
@@ -204,16 +197,13 @@ std::vector<Token> greedy_decode_executorch(
   std::vector<int64_t> sos_token_data = {blank_id};
   auto sos_token = from_blob(
       sos_token_data.data(), {1, 1}, ::executorch::aten::ScalarType::Long);
-  std::cout << "Calling decoder_predict (SOS)..." << std::endl;
   auto decoder_init_result = model.execute(
       "decoder_predict",
       std::vector<::executorch::runtime::EValue>{sos_token, h, c});
   if (!decoder_init_result.ok()) {
-    std::cout << "decoder_predict (SOS) FAILED" << std::endl;
     ET_LOG(Error, "decoder_predict (SOS) failed");
     return hypothesis;
   }
-  std::cout << "decoder_predict (SOS) succeeded" << std::endl;
   auto& init_outputs = decoder_init_result.get();
   auto g_init = init_outputs[0].toTensor();
   auto new_h_init = init_outputs[1].toTensor();
@@ -244,24 +234,11 @@ std::vector<Token> greedy_decode_executorch(
   int64_t t = 0;
   int64_t symbols_on_frame = 0;
 
-  std::cout << "Starting decode loop, encoder_len=" << encoder_len
-            << ", blank_id=" << blank_id
-            << ", num_token_classes=" << num_token_classes << std::endl;
-
   // Scan over encoder output
   while (t < encoder_len) {
-    if (t < 3) {
-      std::cout << "Loop iteration t=" << t << std::endl;
-    }
-
     // Check f_proj dtype
     bool f_proj_is_bf16 =
         f_proj.scalar_type() == ::executorch::aten::ScalarType::BFloat16;
-    if (t == 0) {
-      std::cout << "f_proj dtype: " << (f_proj_is_bf16 ? "bf16" : "f32")
-                << std::endl;
-    }
-
     // Get encoder frame at time t: f_proj[:, t:t+1, :]
     int64_t proj_dim = f_proj.sizes()[2];
 
@@ -312,18 +289,11 @@ std::vector<Token> greedy_decode_executorch(
                        : ::executorch::aten::ScalarType::Float);
 
     // Joint network
-    if (t < 3) {
-      std::cout << "Calling joint network at t=" << t << std::endl;
-    }
     auto joint_result = model.execute(
         "joint", std::vector<::executorch::runtime::EValue>{f_t, g_proj});
     if (!joint_result.ok()) {
-      std::cout << "joint FAILED at t=" << t << std::endl;
       ET_LOG(Error, "joint failed at t=%lld", static_cast<long long>(t));
       return hypothesis;
-    }
-    if (t < 3) {
-      std::cout << "joint succeeded at t=" << t << std::endl;
     }
     auto full_logits = joint_result.get()[0].toTensor();
 
@@ -345,17 +315,6 @@ std::vector<Token> greedy_decode_executorch(
       logits_data = full_logits.const_data_ptr<float>();
     }
 
-    // Debug: print first few timesteps
-    if (t < 3) {
-      std::cout << "t=" << t << " logits[0..5]: ";
-      for (int i = 0; i < 6 && i < full_logits.numel(); i++) {
-        std::cout << logits_data[i] << " ";
-      }
-      std::cout << "... logits[" << num_token_classes - 1
-                << "]=" << logits_data[num_token_classes - 1] << " (blank)"
-                << std::endl;
-    }
-
     // Find argmax for token logits
     int64_t k = 0;
     float max_token_logit = logits_data[0];
@@ -364,12 +323,6 @@ std::vector<Token> greedy_decode_executorch(
         max_token_logit = logits_data[i];
         k = i;
       }
-    }
-
-    // Debug: print argmax result for first few timesteps
-    if (t < 3) {
-      std::cout << "t=" << t << " argmax k=" << k << " (blank_id=" << blank_id
-                << "), max_logit=" << max_token_logit << std::endl;
     }
 
     // Find argmax for duration logits
@@ -496,17 +449,15 @@ int main(int argc, char** argv) {
   auto audio_len_tensor = from_blob(
       audio_len_data.data(), {1}, ::executorch::aten::ScalarType::Long);
 
-  std::cout << "Running preprocessor..." << std::endl;
+  ET_LOG(Info, "Running preprocessor...");
   auto proc_result = model->execute(
       "preprocessor",
       std::vector<::executorch::runtime::EValue>{
           audio_tensor, audio_len_tensor});
-  std::cout << "Preprocessor execute() returned" << std::endl;
   if (!proc_result.ok()) {
     ET_LOG(Error, "Preprocessor forward failed.");
     return 1;
   }
-  std::cout << "Preprocessor completed successfully" << std::endl;
   auto& proc_outputs = proc_result.get();
   auto mel = proc_outputs[0].toTensor();
   auto mel_len_tensor_out = proc_outputs[1].toTensor();
@@ -526,15 +477,12 @@ int main(int argc, char** argv) {
       static_cast<long long>(mel_len_value));
 
   // Run encoder
-  std::cout << "Running encoder..." << std::endl;
   auto enc_result = model->execute(
       "encoder", std::vector<::executorch::runtime::EValue>{mel, mel_len});
-  std::cout << "Encoder execute() returned" << std::endl;
   if (!enc_result.ok()) {
     ET_LOG(Error, "Encoder forward failed.");
     return 1;
   }
-  std::cout << "Encoder completed successfully" << std::endl;
   auto& enc_outputs = enc_result.get();
   auto encoded = enc_outputs[0].toTensor();
   int64_t encoded_len = enc_outputs[1].toTensor().const_data_ptr<int64_t>()[0];
@@ -588,8 +536,6 @@ int main(int argc, char** argv) {
       window_stride,
       encoder_subsampling_factor);
 
-  std::cout << "Running TDT greedy decode..." << std::endl;
-  std::cout << "encoded_len=" << encoded_len << std::endl;
   auto decoded_tokens = greedy_decode_executorch(
       *model,
       encoded,
@@ -598,9 +544,6 @@ int main(int argc, char** argv) {
       vocab_size,
       num_rnn_layers,
       pred_hidden);
-  std::cout << "TDT greedy decode completed" << std::endl;
-
-  std::cout << "Decoded " << decoded_tokens.size() << " tokens" << std::endl;
 
   // Load tokenizer
   ET_LOG(Info, "Loading tokenizer from: %s", FLAGS_tokenizer_path.c_str());
