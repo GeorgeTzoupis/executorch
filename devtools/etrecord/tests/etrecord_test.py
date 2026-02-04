@@ -1746,3 +1746,67 @@ class TestETRecord(unittest.TestCase):
 
             # All essential components are now present, so save should succeed
             etrecord.save(etrecord_path)
+
+    def test_multi_method_etrecord_generation(self):
+        """Test that ETRecord correctly handles multiple methods (e.g., vision_encoder, text_decoder)."""
+        # Create two different models to simulate multi-method export
+        f1 = models.BasicSinMax()
+        f2 = models.BasicSinMax()
+
+        # Export both models
+        aten_program1 = export(f1, f1.get_random_inputs(), strict=True)
+        aten_program2 = export(f2, f2.get_random_inputs(), strict=True)
+
+        # Create multi-method edge program
+        multi_method_programs = {
+            "vision_encoder": aten_program1,
+            "text_decoder": aten_program2,
+        }
+
+        edge_manager = to_edge_transform_and_lower(
+            multi_method_programs,
+            generate_etrecord=True,
+        )
+
+        # Verify that ETRecord was generated
+        self.assertIsNotNone(edge_manager._etrecord)
+        etrecord = edge_manager._etrecord
+
+        # Verify edge_dialect_program is a dict with both methods
+        self.assertIsNotNone(etrecord.edge_dialect_program)
+        self.assertIsInstance(etrecord.edge_dialect_program, dict)
+        self.assertIn("vision_encoder", etrecord.edge_dialect_program)
+        self.assertIn("text_decoder", etrecord.edge_dialect_program)
+
+        # Convert to executorch to get complete ETRecord
+        et_manager = edge_manager.to_executorch()
+
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            etrecord_path = tmpdirname + "/etrecord_multi_method.bin"
+
+            # Get ETRecord and save
+            complete_etrecord = et_manager.get_etrecord()
+            complete_etrecord.save(etrecord_path)
+
+            # Parse ETRecord back
+            parsed_etrecord = parse_etrecord(etrecord_path)
+
+            # Verify edge_dialect_program is correctly parsed as a dict
+            self.assertIsNotNone(parsed_etrecord.edge_dialect_program)
+            self.assertIsInstance(parsed_etrecord.edge_dialect_program, dict)
+            self.assertIn("vision_encoder", parsed_etrecord.edge_dialect_program)
+            self.assertIn("text_decoder", parsed_etrecord.edge_dialect_program)
+
+            # Verify both methods have valid ExportedProgram objects
+            self.assertIsNotNone(parsed_etrecord.edge_dialect_program["vision_encoder"])
+            self.assertIsNotNone(parsed_etrecord.edge_dialect_program["text_decoder"])
+            self.assertIsNotNone(
+                parsed_etrecord.edge_dialect_program["vision_encoder"].graph_module
+            )
+            self.assertIsNotNone(
+                parsed_etrecord.edge_dialect_program["text_decoder"].graph_module
+            )
+
+            # Verify other ETRecord components are preserved
+            self.assertIsNotNone(parsed_etrecord._debug_handle_map)
+            self.assertIsNotNone(parsed_etrecord._delegate_map)
